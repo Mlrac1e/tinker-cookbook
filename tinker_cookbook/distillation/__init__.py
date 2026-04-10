@@ -27,10 +27,11 @@ point. Access them via the submodule to avoid naming conflicts::
     await train_on_policy.main(config)
 """
 
-from tinker_cookbook.distillation import sdft, train_off_policy, train_on_policy
+from tinker_cookbook.distillation import sdft, train_off_policy, train_on_policy, train_wghd
 
 __all__ = [
     "train_on_policy",
     "train_off_policy",
+    "train_wghd",
     "sdft",
 ]
