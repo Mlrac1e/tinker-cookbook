@@ -1,17 +1,16 @@
 """
 Waypoint-Guided Hybrid Distillation (WGHD) for reasoning and code tasks.
 
-This recipe implements WGHD, an extension of on-policy distillation that uses
-Forward-Backward inspired adaptive KL gating. Instead of applying a uniform
-KL penalty across all tokens, WGHD dynamically adjusts the KL weight per
-segment based on how well the student's generation aligns with the teacher's
-logical waypoints (e.g., reasoning steps in math, function boundaries in code).
+This recipe implements WGHD, an extension of on-policy distillation. By default
+it uses **explicit token-chain forward–backward messages** (see
+``tinker_cookbook.distillation.fb_chain``) to set per-token KL weights from local
+teacher–student agreement (forward α) and a terminal potential from trajectory
+return (backward β). Optional ``kl_weight_mode=cosine`` restores segment-wise
+cosine gating at text boundaries plus waypoint process rewards.
 
 Key features:
-  - Adaptive KL gating: Low KL when student is on-track (exploration mode),
-    high KL when student diverges (correction mode)
-  - Process rewards: Bonus reward for matching each teacher waypoint
-  - Segment-level granularity: Between pure token-level and sequence-level
+  - FB-chain KL: Per-token weights from α/β tension on the sampled token chain
+  - Optional cosine mode: Segment-level similarity + process rewards at boundaries
 
 Example usage:
     # Math (DeepMath) with WGHD
@@ -99,8 +98,11 @@ class CLIConfig:
     loss_fn: LossFnType = "importance_sampling"
     loss_fn_config: dict[str, Any] | None = None
 
-    # WGHD-specific: waypoint gating parameters
+    # WGHD-specific: FB chain (default) or cosine waypoint gating
     waypoint_enabled: bool = True
+    kl_weight_mode: str = "fb_chain"
+    fb_emission_delta_scale: float = 1.0
+    fb_terminal_reward_scale: float = 1.0
     task_type: str = "math"
     similarity_threshold: float = 0.5
     gate_temperature: float = 5.0
@@ -178,6 +180,9 @@ async def cli_main(cli_config: CLIConfig):
         step_reward=cli_config.step_reward,
         min_gap_chars=cli_config.min_gap_chars,
         waypoint_store_path=cli_config.waypoint_store_path,
+        kl_weight_mode=cli_config.kl_weight_mode,
+        fb_emission_delta_scale=cli_config.fb_emission_delta_scale,
+        fb_terminal_reward_scale=cli_config.fb_terminal_reward_scale,
     )
 
     config = train_wghd.Config(
