@@ -50,6 +50,9 @@ class TestWaypointConfig:
         assert config.similarity_threshold == 0.5
         assert config.gate_temperature == 5.0
         assert config.step_reward == 0.1
+        assert config.kl_weight_mode == "fb_chain"
+        assert config.fb_emission_delta_scale == 1.0
+        assert config.fb_terminal_reward_scale == 1.0
 
     def test_custom_config(self):
         config = WaypointConfig(

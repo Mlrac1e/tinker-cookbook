@@ -1,20 +1,24 @@
 """
 Waypoint-Guided Hybrid Distillation (WGHD) training engine.
 
-Extends on-policy distillation with Forward-Backward inspired adaptive KL gating.
-Instead of applying a uniform KL penalty across all tokens, WGHD:
+Extends on-policy distillation with explicit **token-chain forward–backward (FB)
+messages** as the default signal for adaptive KL (see :mod:`fb_chain`).
 
-1. Identifies logical waypoints in the teacher's correct trajectories
-2. During on-policy training, compares the student's generation against
-   these waypoints using cosine similarity on logprob distributions
-3. Dynamically adjusts KL penalty per segment:
-   - High similarity → low KL weight (allow student exploration)
-   - Low similarity → high KL weight (enforce teacher guidance)
-4. Awards process rewards for successfully matching waypoints
+**FB mode (``kl_weight_mode="fb_chain"``)** — core modeling contribution:
 
-This provides a middle ground between pure token-level KL (too myopic) and
-pure sequence-level RL (too sparse), implementing the "look forward and backward"
-philosophy described in the Forward-Backward representation theory.
+- Builds per-token emission potentials from teacher vs student log-probabilities on
+  the **sampled** tokens.
+- Runs **forward** log-messages α (prefix accumulation of local teacher agreement)
+  and **backward** log-messages β with a **terminal potential** derived from the
+  trajectory return (outcome at sequence end).
+- Converts the tension between α and β into per-token KL weights (local vs
+  global / terminal-facing tradeoff).
+
+**Cosine mode (``kl_weight_mode="cosine"``)** — heuristic baseline / ablation:
+
+1. Identifies logical waypoints in the teacher's trajectories
+2. Compares the student to waypoints via cosine similarity on local distributions
+3. Adjusts KL per segment and adds waypoint process rewards
 
 Usage:
     from tinker_cookbook.distillation import train_wghd
@@ -44,13 +48,10 @@ from tinker_cookbook.distillation.datasets import (
     CompositeDataset,
     DistillationDatasetConfig,
 )
+from tinker_cookbook.distillation.fb_chain import compute_fb_kl_weights_and_messages
 from tinker_cookbook.distillation.waypoint import (
-    WaypointFeature,
-    WaypointSequence,
     WaypointStore,
     compute_adaptive_kl_weight,
-    compute_segment_kl_weights,
-    compute_waypoint_similarity,
     detect_boundary_positions,
 )
 from tinker_cookbook.eval.evaluators import SamplingClientEvaluator, SamplingClientEvaluatorBuilder
@@ -68,6 +69,7 @@ from tinker_cookbook.rl.train import (
 )
 from tinker_cookbook.rl.types import (
     EnvGroupBuilder,
+    Trajectory,
     TrajectoryGroup,
 )
 from tinker_cookbook.tokenizer_utils import Tokenizer
@@ -79,7 +81,7 @@ logger = logging.getLogger(__name__)
 
 @chz.chz
 class WaypointConfig:
-    """Configuration for waypoint-guided KL gating."""
+    """Configuration for FB-chain KL gating and optional cosine waypoint baseline."""
 
     enabled: bool = True
     task_type: str = "math"
@@ -89,34 +91,43 @@ class WaypointConfig:
     min_gap_chars: int = 50
     waypoint_store_path: str | None = None
 
+    #: ``fb_chain`` = explicit α/β on the token chain (:mod:`fb_chain`); ``cosine`` = legacy waypoint similarity.
+    kl_weight_mode: str = "fb_chain"
+    fb_emission_delta_scale: float = 1.0
+    fb_terminal_reward_scale: float = 1.0
+
 
 @trace.scope
 async def incorporate_kl_penalty_with_waypoints(
     data_D: list[tinker.Datum],
     teacher_clients_D: list[tinker.SamplingClient],
     dataset_indices_D: list[int],
+    total_rewards_D: list[float],
     kl_penalty_coef: float,
     kl_discount_factor: float,
     waypoint_config: WaypointConfig,
     waypoint_store: WaypointStore | None = None,
     tokenizer: Tokenizer | None = None,
 ) -> dict[str, float]:
-    """Compute reverse KL with adaptive per-token weighting based on waypoint similarity.
+    """Compute reverse KL with adaptive per-token weights (FB chain or cosine waypoints).
 
-    Extends the standard on-policy KL penalty with waypoint-guided gating:
-    - Segments where the student aligns with teacher waypoints get reduced KL
-    - Segments where the student diverges get amplified KL
-    - Process rewards are added to advantages for waypoint matches
+    When ``kl_weight_mode == "fb_chain"``, per-token weights come from explicit forward–
+    backward log-messages on the sampled token chain (:mod:`fb_chain`), with terminal
+    mass from ``total_rewards_D``.
+
+    When ``kl_weight_mode == "cosine"``, weights follow segment-wise cosine similarity
+    at text boundaries (legacy WGHD heuristic).
 
     Args:
         data_D: List of datums to compute KL for.
         teacher_clients_D: List of teacher sampling clients, one per datum.
         dataset_indices_D: List of dataset indices, one per datum.
+        total_rewards_D: Trajectory return per datum (for FB terminal potential).
         kl_penalty_coef: Base coefficient for KL penalty.
         kl_discount_factor: Discount factor for future KL.
-        waypoint_config: Configuration for waypoint gating behavior.
-        waypoint_store: Pre-computed waypoint features for teacher trajectories.
-        tokenizer: Tokenizer for decoding student outputs (needed for waypoint matching).
+        waypoint_config: Gating and mode configuration.
+        waypoint_store: Unused by FB mode; kept for API compatibility.
+        tokenizer: Required for cosine mode (decode tokens to find boundaries).
     """
     full_sequence_inputs_D = [
         datum.model_input.append_int(cast(int, datum.loss_fn_inputs["target_tokens"].data[-1]))
@@ -143,27 +154,44 @@ async def incorporate_kl_penalty_with_waypoints(
     total_process_reward = 0.0
     waypoints_matched = 0
     waypoints_total = 0
+    fb_log_alpha_mean = 0.0
+    fb_log_beta_mean = 0.0
+    fb_emission_mean = 0.0
+    fb_datum_count = 0
 
     for i, datum in enumerate(data_D):
         kl_weight_per_token = torch.ones_like(float_masks[i])
         process_reward = 0.0
 
-        if (
-            waypoint_config.enabled
-            and waypoint_store is not None
-            and tokenizer is not None
-        ):
-            kl_weight_per_token, process_reward = _compute_waypoint_gated_weights(
-                datum=datum,
-                teacher_logprobs=teacher_logprobs_D[i],
-                tokenizer=tokenizer,
-                waypoint_store=waypoint_store,
-                waypoint_config=waypoint_config,
-            )
-            total_process_reward += process_reward
-            if process_reward > 0:
-                waypoints_matched += int(process_reward / waypoint_config.step_reward)
-            waypoints_total += 1
+        if waypoint_config.enabled:
+            mode = waypoint_config.kl_weight_mode
+            if mode == "fb_chain":
+                kl_weight_per_token, fb_m = _compute_fb_chain_kl_weights(
+                    datum=datum,
+                    teacher_logprobs=teacher_logprobs_D[i],
+                    total_reward=total_rewards_D[i],
+                    waypoint_config=waypoint_config,
+                )
+                fb_log_alpha_mean += fb_m["fb/log_alpha_mean"]
+                fb_log_beta_mean += fb_m["fb/log_beta_mean"]
+                fb_emission_mean += fb_m["fb/emission_mean"]
+                fb_datum_count += 1
+            elif mode == "cosine" and waypoint_store is not None and tokenizer is not None:
+                kl_weight_per_token, process_reward = _compute_waypoint_gated_weights(
+                    datum=datum,
+                    teacher_logprobs=teacher_logprobs_D[i],
+                    tokenizer=tokenizer,
+                    waypoint_config=waypoint_config,
+                )
+                total_process_reward += process_reward
+                if process_reward > 0:
+                    waypoints_matched += int(process_reward / waypoint_config.step_reward)
+                waypoints_total += 1
+            elif mode not in ("fb_chain", "cosine"):
+                raise ValueError(
+                    f"Unknown waypoint_config.kl_weight_mode: {mode!r}; "
+                    "expected 'fb_chain' or 'cosine'"
+                )
 
         kl_advantages = -kl_penalty_coef * float_masks[i] * reverse_kl[i] * kl_weight_per_token
         if kl_discount_factor > 0:
@@ -193,6 +221,11 @@ async def incorporate_kl_penalty_with_waypoints(
         "wghd/waypoints_matched": float(waypoints_matched),
         "wghd/waypoints_evaluated": float(waypoints_total),
     }
+    if fb_datum_count > 0:
+        n = float(fb_datum_count)
+        metrics["fb/log_alpha_mean"] = fb_log_alpha_mean / n
+        metrics["fb/log_beta_mean"] = fb_log_beta_mean / n
+        metrics["fb/emission_mean"] = fb_emission_mean / n
     for dataset_idx, (kl_sum, mask_sum) in per_dataset_kl.items():
         if mask_sum > 0:
             metrics[f"teacher_kl/dataset_{dataset_idx}"] = float(kl_sum / mask_sum)
@@ -200,16 +233,56 @@ async def incorporate_kl_penalty_with_waypoints(
     return metrics
 
 
+def _compute_fb_chain_kl_weights(
+    datum: tinker.Datum,
+    teacher_logprobs: list[float],
+    total_reward: float,
+    waypoint_config: WaypointConfig,
+) -> tuple[torch.Tensor, dict[str, float]]:
+    """Per-token KL weights from explicit forward–backward messages on the token chain."""
+    mask = datum.loss_fn_inputs["mask"].to_torch().float()
+    seq_len = len(mask)
+    ones = torch.ones(seq_len, dtype=torch.float32)
+    if seq_len == 0:
+        return ones, {"fb/log_alpha_mean": 0.0, "fb/log_beta_mean": 0.0, "fb/emission_mean": 0.0}
+
+    teacher_vec = torch.tensor(teacher_logprobs[1:], dtype=torch.float32)
+    if len(teacher_vec) != seq_len:
+        teacher_vec = teacher_vec[:seq_len]
+        if len(teacher_vec) < seq_len:
+            teacher_vec = torch.cat([teacher_vec, torch.zeros(seq_len - len(teacher_vec))])
+
+    student_logprobs = datum.loss_fn_inputs["logprobs"].to_torch()
+    kl_w, log_alpha, log_beta, emission = compute_fb_kl_weights_and_messages(
+        student_logprobs,
+        teacher_vec,
+        total_reward,
+        emission_delta_scale=waypoint_config.fb_emission_delta_scale,
+        terminal_reward_scale=waypoint_config.fb_terminal_reward_scale,
+        gate_temperature=waypoint_config.gate_temperature,
+    )
+    kl_w = kl_w * mask + (1.0 - mask) * 1.0
+    msum = float(mask.sum().item())
+    if msum <= 0:
+        diag = {"fb/log_alpha_mean": 0.0, "fb/log_beta_mean": 0.0, "fb/emission_mean": 0.0}
+        return kl_w, diag
+    diag = {
+        "fb/log_alpha_mean": float((log_alpha * mask).sum().item() / msum),
+        "fb/log_beta_mean": float((log_beta * mask).sum().item() / msum),
+        "fb/emission_mean": float((emission * mask).sum().item() / msum),
+    }
+    return kl_w, diag
+
+
 def _compute_waypoint_gated_weights(
     datum: tinker.Datum,
     teacher_logprobs: list[float],
     tokenizer: Tokenizer,
-    waypoint_store: WaypointStore,
     waypoint_config: WaypointConfig,
 ) -> tuple[torch.Tensor, float]:
     """Compute per-token KL weights using waypoint similarity for a single datum.
 
-    This is the core FB-inspired gating mechanism. For each waypoint boundary
+    For each waypoint boundary
     in the teacher's trajectory, we measure how well the student's generation
     aligns with the teacher at that checkpoint. Segments that are on-track
     get reduced KL (exploration mode), while off-track segments get amplified
@@ -311,6 +384,19 @@ def _compute_waypoint_gated_weights(
     return kl_weights, process_reward
 
 
+def _total_reward_for_datum(
+    metadata: dict[str, int],
+    trajectory_groups_P: list[TrajectoryGroup],
+) -> float:
+    """Scalar return for one trajectory (step rewards + group final reward)."""
+    group_idx = metadata["group_idx"]
+    traj_idx = metadata["traj_idx"]
+    traj_group = trajectory_groups_P[group_idx]
+    traj: Trajectory = traj_group.trajectories_G[traj_idx]
+    step_sum = sum(t.reward for t in traj.transitions)
+    return float(step_sum + traj_group.final_rewards_G[traj_idx])
+
+
 def _estimate_token_boundaries(
     text: str,
     char_positions: list[int],
@@ -385,7 +471,7 @@ async def prepare_minibatch(
     waypoint_config: WaypointConfig,
     waypoint_store: WaypointStore | None = None,
 ) -> tuple[list[tinker.Datum], dict[str, Any]]:
-    """Converts trajectories into a minibatch with waypoint-guided KL penalty."""
+    """Converts trajectories into a minibatch with FB-chain or cosine KL weighting."""
 
     metrics: dict[str, Any] = {}
     taglist_P = [env_group_builder.logging_tags() for env_group_builder in env_group_builders_P]
@@ -410,10 +496,14 @@ async def prepare_minibatch(
             dataset_indices_D = [
                 dataset_indices_P[metadata["group_idx"]] for metadata in metadata_D
             ]
+            total_rewards_D = [
+                _total_reward_for_datum(metadata, trajectory_groups_P) for metadata in metadata_D
+            ]
             kl_penalty_metrics = await incorporate_kl_penalty_with_waypoints(
                 data_D,
                 teacher_clients_D,
                 dataset_indices_D,
+                total_rewards_D,
                 kl_penalty_coef,
                 kl_discount_factor,
                 waypoint_config=waypoint_config,
