@@ -48,7 +48,10 @@ from tinker_cookbook.distillation.datasets import (
     CompositeDataset,
     DistillationDatasetConfig,
 )
-from tinker_cookbook.distillation.fb_chain import compute_fb_kl_weights_and_messages
+from tinker_cookbook.distillation.fb_chain import (
+    compute_fb_kl_weights_and_messages,
+    terminal_potential_from_reward,
+)
 from tinker_cookbook.distillation.waypoint import (
     WaypointStore,
     compute_adaptive_kl_weight,
@@ -91,10 +94,32 @@ class WaypointConfig:
     min_gap_chars: int = 50
     waypoint_store_path: str | None = None
 
-    #: ``fb_chain`` = explicit α/β on the token chain (:mod:`fb_chain`); ``cosine`` = legacy waypoint similarity.
+    #: ``fb_chain`` = latent-state α/β on the token chain (:mod:`fb_chain`); ``cosine`` = legacy waypoint similarity.
     kl_weight_mode: str = "fb_chain"
     fb_emission_delta_scale: float = 1.0
     fb_terminal_reward_scale: float = 1.0
+
+    # --- Latent-state FB hyperparameters (core method) ---
+    #: Number of latent track states (``K = 2`` = on/off-track, paper default).
+    fb_num_states: int = 2
+    #: Constant emission level for the off-track state; smaller → stronger
+    #: disagreement-driven push toward off-track.
+    fb_emission_off_level: float = 0.3
+    #: Per-step flip probability at non-boundary positions (state persists).
+    fb_transition_flip_prob: float = 0.05
+    #: Mixing weight toward uniform transition at waypoint boundaries (allows reset).
+    fb_boundary_reset_prob: float = 0.5
+    #: Exponent on ``gamma_t(on-track)`` in the per-token KL weight.
+    fb_gate_exponent_gamma: float = 1.0
+    #: Exponent on the multiplicative ``R = sigmoid(rho * return)`` injection
+    #: (0 = outcome enters only through the terminal β factor).
+    fb_gate_exponent_reward: float = 0.0
+    #: Initial probability of being on-track.
+    fb_prior_on_track: float = 0.5
+    #: If ``True``, use waypoint boundaries to modulate transitions.
+    fb_use_waypoint_transition: bool = True
+    #: If ``False``, fall back to the legacy single-state α/β gate (ablation).
+    fb_use_latent: bool = True
 
 
 @trace.scope
@@ -127,7 +152,10 @@ async def incorporate_kl_penalty_with_waypoints(
         kl_discount_factor: Discount factor for future KL.
         waypoint_config: Gating and mode configuration.
         waypoint_store: Unused by FB mode; kept for API compatibility.
-        tokenizer: Required for cosine mode (decode tokens to find boundaries).
+        tokenizer: Required for cosine mode and optional for ``fb_chain`` mode
+            (used to decode tokens and derive waypoint-induced transition
+            boundaries). ``fb_chain`` without a tokenizer falls back to a
+            stationary transition matrix.
     """
     full_sequence_inputs_D = [
         datum.model_input.append_int(cast(int, datum.loss_fn_inputs["target_tokens"].data[-1]))
@@ -157,6 +185,9 @@ async def incorporate_kl_penalty_with_waypoints(
     fb_log_alpha_mean = 0.0
     fb_log_beta_mean = 0.0
     fb_emission_mean = 0.0
+    fb_kl_weight_mean = 0.0
+    fb_boundary_count_total = 0.0
+    fb_terminal_reward_mean = 0.0
     fb_datum_count = 0
 
     for i, datum in enumerate(data_D):
@@ -171,10 +202,14 @@ async def incorporate_kl_penalty_with_waypoints(
                     teacher_logprobs=teacher_logprobs_D[i],
                     total_reward=total_rewards_D[i],
                     waypoint_config=waypoint_config,
+                    tokenizer=tokenizer,
                 )
                 fb_log_alpha_mean += fb_m["fb/log_alpha_mean"]
                 fb_log_beta_mean += fb_m["fb/log_beta_mean"]
                 fb_emission_mean += fb_m["fb/emission_mean"]
+                fb_kl_weight_mean += fb_m["fb/kl_weight_mean"]
+                fb_boundary_count_total += fb_m["fb/boundary_count"]
+                fb_terminal_reward_mean += fb_m["fb/terminal_reward"]
                 fb_datum_count += 1
             elif mode == "cosine" and waypoint_store is not None and tokenizer is not None:
                 kl_weight_per_token, process_reward = _compute_waypoint_gated_weights(
@@ -226,6 +261,9 @@ async def incorporate_kl_penalty_with_waypoints(
         metrics["fb/log_alpha_mean"] = fb_log_alpha_mean / n
         metrics["fb/log_beta_mean"] = fb_log_beta_mean / n
         metrics["fb/emission_mean"] = fb_emission_mean / n
+        metrics["fb/kl_weight_mean"] = fb_kl_weight_mean / n
+        metrics["fb/boundary_count_mean"] = fb_boundary_count_total / n
+        metrics["fb/terminal_reward_mean"] = fb_terminal_reward_mean / n
     for dataset_idx, (kl_sum, mask_sum) in per_dataset_kl.items():
         if mask_sum > 0:
             metrics[f"teacher_kl/dataset_{dataset_idx}"] = float(kl_sum / mask_sum)
@@ -233,18 +271,75 @@ async def incorporate_kl_penalty_with_waypoints(
     return metrics
 
 
+_EMPTY_FB_DIAG: dict[str, float] = {
+    "fb/log_alpha_mean": 0.0,
+    "fb/log_beta_mean": 0.0,
+    "fb/emission_mean": 0.0,
+    "fb/kl_weight_mean": 0.0,
+    "fb/boundary_count": 0.0,
+    "fb/terminal_reward": 0.0,
+}
+
+
+def _build_fb_boundary_mask(
+    datum: tinker.Datum,
+    seq_len: int,
+    tokenizer: Tokenizer | None,
+    waypoint_config: WaypointConfig,
+) -> torch.Tensor | None:
+    """Build a 0/1 boundary mask of shape ``(seq_len,)`` from waypoint detection.
+
+    Returns ``None`` when waypoint transitions are disabled, the tokenizer is
+    unavailable, decoding fails, or no boundaries are found.
+    """
+    if (
+        not waypoint_config.fb_use_waypoint_transition
+        or tokenizer is None
+        or not waypoint_config.task_type
+    ):
+        return None
+    try:
+        target_tokens = datum.loss_fn_inputs["target_tokens"].data
+        decoded_text = tokenizer.decode(target_tokens)
+    except Exception:
+        return None
+    boundary_chars = detect_boundary_positions(
+        decoded_text,
+        task_type=waypoint_config.task_type,
+        min_gap_chars=waypoint_config.min_gap_chars,
+    )
+    if not boundary_chars:
+        return None
+    token_idxs = _estimate_token_boundaries(decoded_text, boundary_chars, seq_len)
+    if not token_idxs:
+        return None
+    bm = torch.zeros(seq_len, dtype=torch.float32)
+    for idx in token_idxs:
+        if 0 <= idx < seq_len:
+            bm[idx] = 1.0
+    if bm.sum().item() == 0.0:
+        return None
+    return bm
+
+
 def _compute_fb_chain_kl_weights(
     datum: tinker.Datum,
     teacher_logprobs: list[float],
     total_reward: float,
     waypoint_config: WaypointConfig,
+    tokenizer: Tokenizer | None = None,
 ) -> tuple[torch.Tensor, dict[str, float]]:
-    """Per-token KL weights from explicit forward–backward messages on the token chain."""
+    """Per-token KL weights from the latent-state forward-backward posterior.
+
+    Returns ``(kl_weights, diagnostics)``. Diagnostics include per-token means
+    of the on-track log α / log β / emission slices, the average KL weight,
+    the number of waypoint boundaries used, and the terminal reward factor.
+    """
     mask = datum.loss_fn_inputs["mask"].to_torch().float()
     seq_len = len(mask)
     ones = torch.ones(seq_len, dtype=torch.float32)
     if seq_len == 0:
-        return ones, {"fb/log_alpha_mean": 0.0, "fb/log_beta_mean": 0.0, "fb/emission_mean": 0.0}
+        return ones, dict(_EMPTY_FB_DIAG)
 
     teacher_vec = torch.tensor(teacher_logprobs[1:], dtype=torch.float32)
     if len(teacher_vec) != seq_len:
@@ -253,6 +348,9 @@ def _compute_fb_chain_kl_weights(
             teacher_vec = torch.cat([teacher_vec, torch.zeros(seq_len - len(teacher_vec))])
 
     student_logprobs = datum.loss_fn_inputs["logprobs"].to_torch()
+
+    boundary_mask = _build_fb_boundary_mask(datum, seq_len, tokenizer, waypoint_config)
+
     kl_w, log_alpha, log_beta, emission = compute_fb_kl_weights_and_messages(
         student_logprobs,
         teacher_vec,
@@ -260,16 +358,34 @@ def _compute_fb_chain_kl_weights(
         emission_delta_scale=waypoint_config.fb_emission_delta_scale,
         terminal_reward_scale=waypoint_config.fb_terminal_reward_scale,
         gate_temperature=waypoint_config.gate_temperature,
+        boundary_mask=boundary_mask,
+        num_states=waypoint_config.fb_num_states,
+        emission_off_level=waypoint_config.fb_emission_off_level,
+        transition_flip_prob=waypoint_config.fb_transition_flip_prob,
+        boundary_reset_prob=waypoint_config.fb_boundary_reset_prob,
+        gate_exponent_gamma=waypoint_config.fb_gate_exponent_gamma,
+        gate_exponent_reward=waypoint_config.fb_gate_exponent_reward,
+        prior_on_track=waypoint_config.fb_prior_on_track,
+        use_latent_fb=waypoint_config.fb_use_latent,
     )
     kl_w = kl_w * mask + (1.0 - mask) * 1.0
     msum = float(mask.sum().item())
+    r_terminal = float(
+        terminal_potential_from_reward(total_reward, waypoint_config.fb_terminal_reward_scale)
+    )
+    b_count = float(boundary_mask.sum().item()) if boundary_mask is not None else 0.0
     if msum <= 0:
-        diag = {"fb/log_alpha_mean": 0.0, "fb/log_beta_mean": 0.0, "fb/emission_mean": 0.0}
+        diag = dict(_EMPTY_FB_DIAG)
+        diag["fb/boundary_count"] = b_count
+        diag["fb/terminal_reward"] = r_terminal
         return kl_w, diag
     diag = {
         "fb/log_alpha_mean": float((log_alpha * mask).sum().item() / msum),
         "fb/log_beta_mean": float((log_beta * mask).sum().item() / msum),
         "fb/emission_mean": float((emission * mask).sum().item() / msum),
+        "fb/kl_weight_mean": float((kl_w * mask).sum().item() / msum),
+        "fb/boundary_count": b_count,
+        "fb/terminal_reward": r_terminal,
     }
     return kl_w, diag
 

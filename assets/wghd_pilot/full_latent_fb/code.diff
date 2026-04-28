@@ -1,0 +1,1399 @@
+### repo: /mnt/data/x2robot_v2/miracle/distillation/tinker-cookbook @ 357adcc56df36569358b53af27638e440b27bef9
+modules: tinker_cookbook
+-- repo-wide (vs HEAD, staged+unstaged) --
+diff --git a/tinker_cookbook/distillation/fb_chain.py b/tinker_cookbook/distillation/fb_chain.py
+index fc9a6af..69f2efb 100644
+--- a/tinker_cookbook/distillation/fb_chain.py
++++ b/tinker_cookbook/distillation/fb_chain.py
+@@ -1,23 +1,49 @@
+ """
+-Token-chain forward–backward messages for on-policy distillation.
++Latent-state forward-backward (FB) messages for on-policy distillation.
+ 
+-We model the student's sampled trajectory as a length-T chain with one scalar
+-emission potential per position (local teacher–student agreement on the *sampled*
+-token). This yields explicit forward messages α and backward messages β in log
+-domain; β is initialized from a terminal potential derived from the trajectory
+-reward (outcome at the end of the episode).
++We treat the student's sampled trajectory as an HMM over a small latent "track
++state" ``z_t`` (by default binary: ``on-track`` / ``off-track``) with:
+ 
+-This is the computational core for an FB-centric story: α encodes cumulative
+-local (prefix) consistency with the teacher; β encodes how much terminal mass
+-remains when conditioning on the future (including the final outcome).
++* **Emission**: local teacher-student agreement on the sampled token. When the
++  student and teacher agree, the ``on-track`` state has high emission; the
++  ``off-track`` state has a fixed background level, so disagreement naturally
++  pushes posterior mass toward ``off-track``.
++* **Transition**: structured by *waypoint boundaries* on the decoded text. At
++  non-boundary steps, transitions are near-identity (state persists); at
++  boundary steps, transitions interpolate toward uniform, i.e. the latent
++  state may reset. This injects process structure (math steps, code blocks,
++  agentic sub-goals) as a **prior** on where credit can change.
++* **Terminal factor**: trajectory return ``R = sigmoid(rho * total_reward)``
++  enters as the terminal β initialization, putting mass on ``on-track``
++  proportional to ``R``.
++
++Running the standard HMM forward-backward yields the posterior edge marginal
++``gamma_t(z)``; we use ``gamma_t(on-track)`` (optionally powered by a trajectory
++scalar ``R``) as the per-token KL weight in the student's distillation loss.
++
++This is the computational core of an **outcome-conditioned posterior
++regularization** view of on-policy distillation. Unlike a degenerate,
++single-state FB (which is algebraically equivalent to cumulative emission up to
++a constant), the latent chain lets β carry information that α cannot, and lets
++the terminal reward modulate per-token weights beyond a sequence-constant
++offset.
++
++Backward-compatible primitives (``forward_log_messages``,
++``backward_log_messages``, ``kl_weights_from_fb_tension``) are retained so the
++degenerate single-state recipe remains available as an ablation.
+ """
+ 
+ from __future__ import annotations
+ 
+ import math
++from dataclasses import dataclass
+ 
+ import torch
+ 
++# --------------------------------------------------------------------------- #
++# Low-level helpers                                                           #
++# --------------------------------------------------------------------------- #
++
+ 
+ def _safe_log(x: torch.Tensor) -> torch.Tensor:
+     return torch.log(x.clamp(min=1e-12))
+@@ -28,17 +54,17 @@ def local_emission_from_logprob_diff(
+     teacher_logprobs: torch.Tensor,
+     delta_scale: float,
+ ) -> torch.Tensor:
+-    """Scalar emission in (0, 1] from per-position logprob gap on the sampled token.
++    """Scalar ``on-track`` emission in (0, 1] from per-position logprob gap.
+ 
+     Both tensors must have the same length (one value per generated token).
+ 
+     Args:
+-        student_logprobs: Per-token log p_student(a_t | prefix) for sampled actions.
+-        teacher_logprobs: Per-token log p_teacher(a_t | prefix) on the same tokens.
++        student_logprobs: Per-token ``log p_student(a_t | prefix)`` for sampled actions.
++        teacher_logprobs: Per-token ``log p_teacher(a_t | prefix)`` on the same tokens.
+         delta_scale: Positive constant; larger → sharper agreement requirement.
+ 
+     Returns:
+-        Tensor of shape (T,) with values in (0, 1].
++        Tensor of shape ``(T,)`` with values in ``(0, 1]``.
+     """
+     diff = (student_logprobs - teacher_logprobs).abs()
+     return torch.exp(-delta_scale * diff).clamp(1e-8, 1.0)
+@@ -48,29 +74,31 @@ def terminal_potential_from_reward(
+     total_reward: float,
+     reward_scale: float,
+ ) -> float:
+-    """Map scalar trajectory return to a terminal factor R in (0, 1].
++    """Map scalar trajectory return to a terminal factor ``R`` in ``(0, 1]``.
+ 
+-    Large positive rewards → R → 1; large negative → R → 0.
++    Large positive rewards → ``R → 1``; large negative → ``R → 0``.
+     """
+     if reward_scale <= 0:
+         reward_scale = 1.0
+-    r = float(torch.sigmoid(torch.tensor(reward_scale * float(total_reward))).item())
++    r = 1.0 / (1.0 + math.exp(-float(reward_scale) * float(total_reward)))
+     return max(r, 1e-8)
+ 
+ 
++# --------------------------------------------------------------------------- #
++# Legacy single-state FB (kept for backward compatibility / ablation).        #
++# --------------------------------------------------------------------------- #
++
++
+ def forward_log_messages(emission: torch.Tensor) -> torch.Tensor:
+-    """Chain forward: log α[t] = sum_{k<=t} log e_k."""
++    """Chain forward (single-state, legacy): ``log α[t] = sum_{k<=t} log e_k``."""
+     log_e = _safe_log(emission)
+     return torch.cumsum(log_e, dim=0)
+ 
+ 
+ def backward_log_messages(emission: torch.Tensor, terminal_r: float) -> torch.Tensor:
+-    """Chain backward with terminal R at the end of the sequence.
+-
+-    log β[T-1] = log R
+-    log β[t] = log β[t+1] + log e[t+1]  for t = T-2 .. 0
++    """Chain backward with terminal ``R`` at the end of the sequence (legacy).
+ 
+-    So β[t] aggregates emissions *after* t and the terminal potential (HMM-style).
++    ``log β[T-1] = log R`` and ``log β[t] = log β[t+1] + log e[t+1]``.
+     """
+     t_len = emission.shape[0]
+     if t_len == 0:
+@@ -89,59 +117,387 @@ def kl_weights_from_fb_tension(
+     log_beta: torch.Tensor,
+     gate_temperature: float,
+ ) -> torch.Tensor:
+-    """Per-token KL multipliers from z-scored log α vs log β contrast.
+-
+-    When z(log β) - z(log α) is large, backward (global / terminal-facing) mass
+-    dominates at that position → lower KL weight. When the opposite holds,
+-    weight increases to pull the student toward the teacher.
+-
+-    Args:
+-        log_alpha: Forward log messages, shape (T,).
+-        log_beta: Backward log messages, shape (T,).
+-        gate_temperature: Sharpness of the sigmoid gate (same role as WGHD gate).
+-
+-    Returns:
+-        KL weights in (0, 1), shape (T,).
++    """Legacy z-scored α/β gate. Note: in the single-state chain this reduces to
++    a sigmoid of normalized cumulative emission, because ``log α + log β`` is
++    constant in ``t``. Kept for ablation; prefer :func:`compute_latent_fb`.
+     """
+     if log_alpha.numel() == 0:
+         return log_alpha
+     z_a = (log_alpha - log_alpha.mean()) / (log_alpha.std(unbiased=False).clamp(min=1e-6))
+     z_b = (log_beta - log_beta.mean()) / (log_beta.std(unbiased=False).clamp(min=1e-6))
+-    # High z_b relative to z_a → lower KL (trust global signal more).
+     x = gate_temperature * (z_b - z_a)
+     return torch.sigmoid(x)
+ 
+ 
+-def compute_fb_kl_weights_and_messages(
++# --------------------------------------------------------------------------- #
++# Latent-state FB (core method).                                              #
++# --------------------------------------------------------------------------- #
++
++
++def build_latent_emission(
++    agreement: torch.Tensor,
++    emission_off_level: float,
++    num_states: int = 2,
++) -> torch.Tensor:
++    """Per-token log-emission over ``K`` latent states.
++
++    * State ``K-1`` (``on-track``) uses the teacher-student ``agreement`` directly.
++    * State ``0`` (``off-track``) uses ``emission_off_level`` (constant).
++    * For ``K > 2``, intermediate states linearly interpolate between the two,
++      allowing finer-grained state ablations.
++
++    Args:
++        agreement: Shape ``(T,)`` in ``(0, 1]``, typically from
++            :func:`local_emission_from_logprob_diff`.
++        emission_off_level: Constant emission for the off-track state. Values in
++            ``(0, 1)`` are recommended; smaller → disagreement more quickly
++            pushes posterior toward off-track.
++        num_states: Number of latent states ``K``. ``K = 2`` is the default
++            paper configuration.
++
++    Returns:
++        Log-emission tensor of shape ``(T, K)``.
++    """
++    if num_states < 1:
++        raise ValueError("num_states must be >= 1")
++    t = agreement.shape[0]
++    if t == 0:
++        return agreement.new_zeros(0, num_states)
++    agreement_c = agreement.clamp(1e-8, 1.0)
++    if num_states == 1:
++        return _safe_log(agreement_c).unsqueeze(-1)
++    off = agreement.new_full((t,), float(emission_off_level))
++    cols = []
++    for k in range(num_states):
++        w = k / (num_states - 1)
++        mix = (1.0 - w) * off + w * agreement_c
++        cols.append(_safe_log(mix))
++    return torch.stack(cols, dim=-1)
++
++
++def build_boundary_transition(
++    seq_len: int,
++    boundary_mask: torch.Tensor | None,
++    flip_prob: float,
++    boundary_reset_prob: float,
++    num_states: int = 2,
++    *,
++    device: torch.device | None = None,
++    dtype: torch.dtype | None = None,
++) -> torch.Tensor:
++    """Per-step log-transition induced by waypoint boundaries.
++
++    At non-boundary steps, the transition matrix is ``stay`` on the diagonal and
++    ``move`` uniformly elsewhere, with ``stay = 1 - flip_prob * (K-1)/K``. At
++    boundary steps, the transition is mixed toward the uniform matrix with
++    weight ``boundary_reset_prob``, allowing the latent state to reset at
++    logical breakpoints.
++
++    Args:
++        seq_len: ``T``.
++        boundary_mask: Shape ``(T,)`` float in ``{0, 1}``. ``boundary_mask[t] = 1``
++            marks the end of a waypoint segment: the transition ``t -> t+1``
++            uses the reset distribution. ``None`` → no boundaries.
++        flip_prob: Per-step flip probability at non-boundary steps.
++        boundary_reset_prob: Interpolation weight toward uniform at boundaries.
++        num_states: ``K``.
++
++    Returns:
++        Tensor of shape ``(T-1, K, K)`` with log-probabilities. Empty when
++        ``T <= 1``.
++    """
++    if num_states < 1:
++        raise ValueError("num_states must be >= 1")
++    k = num_states
++    dtype_ = dtype or torch.float32
++
++    if seq_len <= 1:
++        return torch.zeros((0, k, k), dtype=dtype_, device=device)
++
++    flip = float(max(0.0, min(1.0, flip_prob)))
++    reset = float(max(0.0, min(1.0, boundary_reset_prob)))
++
++    if k == 1:
++        trans_nb = torch.ones((1, 1), dtype=dtype_, device=device)
++        trans_b = trans_nb.clone()
++    else:
++        stay = 1.0 - flip * (k - 1) / k
++        move = flip / k
++        trans_nb = torch.full((k, k), move, dtype=dtype_, device=device)
++        trans_nb.fill_diagonal_(stay)
++        uniform = torch.full((k, k), 1.0 / k, dtype=dtype_, device=device)
++        trans_b = (1.0 - reset) * trans_nb + reset * uniform
++
++    log_nb = _safe_log(trans_nb)
++    log_b = _safe_log(trans_b)
++
++    t_minus = seq_len - 1
++    if boundary_mask is None:
++        return log_nb.unsqueeze(0).expand(t_minus, k, k).contiguous()
++
++    bm = boundary_mask.to(dtype=dtype_, device=device)
++    if bm.shape[0] != seq_len:
++        raise ValueError(
++            f"boundary_mask length {bm.shape[0]} does not match seq_len {seq_len}"
++        )
++    gate = bm[:t_minus].view(t_minus, 1, 1)
++    return (1.0 - gate) * log_nb + gate * log_b
++
++
++def latent_forward_backward(
++    log_emission: torch.Tensor,
++    log_transition: torch.Tensor,
++    log_prior: torch.Tensor,
++    log_terminal: torch.Tensor,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Log-space HMM forward-backward with a terminal log-potential folded
++    into the last ``β`` step.
++
++    Args:
++        log_emission: ``(T, K)``.
++        log_transition: ``(T-1, K, K)`` (time-varying) or ``(K, K)`` (stationary).
++        log_prior: ``(K,)`` initial state log-probabilities.
++        log_terminal: ``(K,)`` terminal log-potential; sets ``β[T-1] = log_terminal``.
++
++    Returns:
++        Tuple ``(log_alpha, log_beta, log_gamma)`` each of shape ``(T, K)``,
++        where ``log_gamma`` is the row-normalized log posterior edge marginal.
++    """
++    t_len, k = log_emission.shape
++    if t_len == 0:
++        z = log_emission.new_zeros(0, k)
++        return z, z, z
++
++    stationary = log_transition.dim() == 2
++
++    log_alpha = log_emission.new_zeros(t_len, k)
++    log_alpha[0] = log_prior + log_emission[0]
++    for t in range(1, t_len):
++        trans_t = log_transition if stationary else log_transition[t - 1]
++        log_alpha[t] = (
++            torch.logsumexp(log_alpha[t - 1].unsqueeze(-1) + trans_t, dim=0)
++            + log_emission[t]
++        )
++
++    log_beta = log_emission.new_zeros(t_len, k)
++    log_beta[t_len - 1] = log_terminal
++    for t in range(t_len - 2, -1, -1):
++        trans_t = log_transition if stationary else log_transition[t]
++        log_beta[t] = torch.logsumexp(
++            trans_t + (log_emission[t + 1] + log_beta[t + 1]).unsqueeze(0),
++            dim=-1,
++        )
++
++    log_ab = log_alpha + log_beta
++    log_gamma = log_ab - torch.logsumexp(log_ab, dim=-1, keepdim=True)
++    return log_alpha, log_beta, log_gamma
++
++
++# --------------------------------------------------------------------------- #
++# High-level API.                                                             #
++# --------------------------------------------------------------------------- #
++
++
++@dataclass
++class LatentFBResult:
++    """Richer output of :func:`compute_latent_fb`."""
++
++    kl_weights: torch.Tensor  #: ``(T,)`` per-token KL multiplier in ``[0, 1]``.
++    log_alpha: torch.Tensor  #: ``(T, K)``
++    log_beta: torch.Tensor  #: ``(T, K)``
++    log_gamma: torch.Tensor  #: ``(T, K)`` log posterior edge marginal.
++    emission: torch.Tensor  #: ``(T, K)`` emission probabilities (not log).
++    terminal_reward: float  #: ``R = sigmoid(rho * total_reward)``.
++
++
++def _build_priorlike(
++    on_track_mass: float,
++    num_states: int,
++    *,
++    device: torch.device | None,
++    dtype: torch.dtype,
++) -> torch.Tensor:
++    """Place ``on_track_mass`` on state ``K-1``, split the rest uniformly across
++    the remaining states, and return the normalized vector (shape ``(K,)``).
++    """
++    on = float(max(0.0, min(1.0, on_track_mass)))
++    if num_states == 1:
++        vec = torch.ones(1, device=device, dtype=dtype)
++    else:
++        off_share = (1.0 - on) / (num_states - 1)
++        vec = torch.full((num_states,), off_share, device=device, dtype=dtype)
++        vec[num_states - 1] = on
++    return vec / vec.sum()
++
++
++def compute_latent_fb(
+     student_logprobs: torch.Tensor,
+     teacher_logprobs: torch.Tensor,
+     total_reward: float,
+     *,
+     emission_delta_scale: float,
+     terminal_reward_scale: float,
+-    gate_temperature: float,
+-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+-    """Compute per-token KL weights and diagnostic log α, log β.
++    boundary_mask: torch.Tensor | None = None,
++    num_states: int = 2,
++    emission_off_level: float = 0.3,
++    transition_flip_prob: float = 0.05,
++    boundary_reset_prob: float = 0.5,
++    gate_exponent_gamma: float = 1.0,
++    gate_exponent_reward: float = 0.0,
++    prior_on_track: float = 0.5,
++) -> LatentFBResult:
++    """Full latent-state FB + posterior-regularized KL weights.
++
++    The per-token weight is::
++
++        w_t = gamma_t(on-track) ** gate_exponent_gamma
++              * R ** gate_exponent_reward
++
++    ``R`` already enters through the terminal factor, so
++    ``gate_exponent_reward = 0`` is a clean "only-through-posterior" setting;
++    set ``> 0`` for stronger outcome gating.
+ 
+     Args:
+-        student_logprobs: Shape (T,).
+-        teacher_logprobs: Shape (T,), aligned with student on sampled tokens.
+-        total_reward: Scalar trajectory return (sum of step rewards + group reward).
++        student_logprobs: Shape ``(T,)``.
++        teacher_logprobs: Shape ``(T,)``, aligned with the sampled tokens.
++        total_reward: Scalar trajectory return.
+         emission_delta_scale: Passed to :func:`local_emission_from_logprob_diff`.
+         terminal_reward_scale: Passed to :func:`terminal_potential_from_reward`.
+-        gate_temperature: Sigmoid sharpness for KL weights.
++        boundary_mask: ``(T,)`` float in ``{0, 1}``; waypoint boundaries inducing
++            latent-state resets via the transition matrix. ``None`` → stationary.
++        num_states: Latent state count ``K``. ``2`` is the paper default.
++        emission_off_level: Constant emission for the off-track state.
++        transition_flip_prob: Non-boundary per-step flip probability.
++        boundary_reset_prob: Boundary-step mix weight toward uniform.
++        gate_exponent_gamma: Exponent on ``gamma_t(on-track)`` in the weight.
++        gate_exponent_reward: Exponent on the multiplicative ``R`` injection.
++        prior_on_track: Initial probability of being on-track.
+ 
+     Returns:
+-        (kl_weights, log_alpha, log_beta, emission) each shape (T,) except scalars N/A.
++        :class:`LatentFBResult`.
++    """
++    t_len = student_logprobs.shape[0]
++    k = num_states
++    device = student_logprobs.device
++    dtype = student_logprobs.dtype
++
++    if t_len == 0:
++        z = student_logprobs.new_zeros(0, k)
++        return LatentFBResult(
++            kl_weights=student_logprobs.new_zeros(0),
++            log_alpha=z,
++            log_beta=z,
++            log_gamma=z,
++            emission=z,
++            terminal_reward=1.0,
++        )
++
++    agreement = local_emission_from_logprob_diff(
++        student_logprobs, teacher_logprobs, emission_delta_scale
++    )
++    log_emission = build_latent_emission(agreement, emission_off_level, k)
++    emission = torch.exp(log_emission)
++
++    log_trans = build_boundary_transition(
++        seq_len=t_len,
++        boundary_mask=boundary_mask,
++        flip_prob=transition_flip_prob,
++        boundary_reset_prob=boundary_reset_prob,
++        num_states=k,
++        device=device,
++        dtype=dtype,
++    )
++
++    prior = _build_priorlike(prior_on_track, k, device=device, dtype=dtype)
++    log_prior = _safe_log(prior)
++
++    r = terminal_potential_from_reward(total_reward, terminal_reward_scale)
++    terminal = _build_priorlike(r, k, device=device, dtype=dtype)
++    log_terminal = _safe_log(terminal)
++
++    log_alpha, log_beta, log_gamma = latent_forward_backward(
++        log_emission, log_trans, log_prior, log_terminal
++    )
++
++    log_gamma_on = log_gamma[:, k - 1]
++    weights = torch.exp(gate_exponent_gamma * log_gamma_on)
++    if gate_exponent_reward != 0.0:
++        weights = weights * (r ** float(gate_exponent_reward))
++    weights = weights.clamp(0.0, 1.0)
++
++    return LatentFBResult(
++        kl_weights=weights,
++        log_alpha=log_alpha,
++        log_beta=log_beta,
++        log_gamma=log_gamma,
++        emission=emission,
++        terminal_reward=r,
++    )
++
++
++def compute_fb_kl_weights_and_messages(
++    student_logprobs: torch.Tensor,
++    teacher_logprobs: torch.Tensor,
++    total_reward: float,
++    *,
++    emission_delta_scale: float,
++    terminal_reward_scale: float,
++    gate_temperature: float,
++    boundary_mask: torch.Tensor | None = None,
++    num_states: int = 2,
++    emission_off_level: float = 0.3,
++    transition_flip_prob: float = 0.05,
++    boundary_reset_prob: float = 0.5,
++    gate_exponent_gamma: float = 1.0,
++    gate_exponent_reward: float = 0.0,
++    prior_on_track: float = 0.5,
++    use_latent_fb: bool = True,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
++    """Back-compatible entry point returning ``(T,)``-shaped diagnostics.
++
++    When ``use_latent_fb`` is ``True`` (default), runs the latent-state FB with
++    optional waypoint transitions and multiplicative terminal reward. The
++    returned ``log_alpha`` / ``log_beta`` / ``emission`` are the on-track
++    slices of the full ``(T, K)`` tensors, for drop-in compatibility with
++    existing call sites that average per-token.
++
++    When ``use_latent_fb`` is ``False``, falls back to the legacy single-state
++    FB plus z-scored α/β gate (kept for ablation; ``gate_temperature`` is used
++    only in this branch).
+     """
+     if student_logprobs.shape[0] == 0:
+         z = student_logprobs
+         return z, z, z, z
+-    emission = local_emission_from_logprob_diff(
+-        student_logprobs, teacher_logprobs, emission_delta_scale
++
++    if not use_latent_fb:
++        emission = local_emission_from_logprob_diff(
++            student_logprobs, teacher_logprobs, emission_delta_scale
++        )
++        r = terminal_potential_from_reward(total_reward, terminal_reward_scale)
++        log_alpha = forward_log_messages(emission)
++        log_beta = backward_log_messages(emission, r)
++        kl_w = kl_weights_from_fb_tension(log_alpha, log_beta, gate_temperature)
++        return kl_w, log_alpha, log_beta, emission
++
++    result = compute_latent_fb(
++        student_logprobs,
++        teacher_logprobs,
++        total_reward,
++        emission_delta_scale=emission_delta_scale,
++        terminal_reward_scale=terminal_reward_scale,
++        boundary_mask=boundary_mask,
++        num_states=num_states,
++        emission_off_level=emission_off_level,
++        transition_flip_prob=transition_flip_prob,
++        boundary_reset_prob=boundary_reset_prob,
++        gate_exponent_gamma=gate_exponent_gamma,
++        gate_exponent_reward=gate_exponent_reward,
++        prior_on_track=prior_on_track,
++    )
++    on = num_states - 1
++    return (
++        result.kl_weights,
++        result.log_alpha[:, on],
++        result.log_beta[:, on],
++        result.emission[:, on],
+     )
+-    r = terminal_potential_from_reward(total_reward, terminal_reward_scale)
+-    log_alpha = forward_log_messages(emission)
+-    log_beta = backward_log_messages(emission, r)
+-    kl_w = kl_weights_from_fb_tension(log_alpha, log_beta, gate_temperature)
+-    return kl_w, log_alpha, log_beta, emission
+diff --git a/tinker_cookbook/distillation/fb_chain_test.py b/tinker_cookbook/distillation/fb_chain_test.py
+index 00d9e1b..94617bf 100644
+--- a/tinker_cookbook/distillation/fb_chain_test.py
++++ b/tinker_cookbook/distillation/fb_chain_test.py
+@@ -1,17 +1,28 @@
+-"""Unit tests for token-chain forward–backward helpers."""
++"""Unit tests for token-chain forward-backward helpers."""
++
++import math
+ 
+ import torch
+ 
+ from tinker_cookbook.distillation.fb_chain import (
++    LatentFBResult,
+     backward_log_messages,
++    build_boundary_transition,
++    build_latent_emission,
+     compute_fb_kl_weights_and_messages,
++    compute_latent_fb,
+     forward_log_messages,
++    latent_forward_backward,
+     local_emission_from_logprob_diff,
+     terminal_potential_from_reward,
+ )
+ 
++# --------------------------------------------------------------------------- #
++# Legacy single-state primitives (kept for back-compat / ablation).           #
++# --------------------------------------------------------------------------- #
++
+ 
+-class TestForwardBackwardChain:
++class TestLegacyPrimitives:
+     def test_forward_cumsum(self):
+         e = torch.tensor([0.5, 0.5, 0.5])
+         log_a = forward_log_messages(e)
+@@ -24,8 +35,19 @@ class TestForwardBackwardChain:
+         log_b = backward_log_messages(e, terminal_r=0.5)
+         assert log_b.shape == e.shape
+         assert torch.isfinite(log_b).all()
++        assert torch.allclose(log_b[2], torch.tensor(math.log(0.5)))
++
++    def test_emission_agreement(self):
++        x = torch.zeros(4)
++        y = torch.zeros(4)
++        e = local_emission_from_logprob_diff(x, y, delta_scale=1.0)
++        assert torch.allclose(e, torch.ones_like(e))
++
++    def test_terminal_sigmoid(self):
++        r = terminal_potential_from_reward(5.0, reward_scale=1.0)
++        assert 0 < r <= 1
+ 
+-    def test_fb_weights_shape_and_range(self):
++    def test_legacy_branch_preserved(self):
+         s = torch.tensor([-1.0, -2.0, -0.5])
+         t = torch.tensor([-1.1, -1.9, -0.4])
+         w, la, lb, em = compute_fb_kl_weights_and_messages(
+@@ -35,20 +57,256 @@ class TestForwardBackwardChain:
+             emission_delta_scale=1.0,
+             terminal_reward_scale=1.0,
+             gate_temperature=2.0,
++            use_latent_fb=False,
+         )
+-        assert w.shape == s.shape
+-        assert la.shape == s.shape
+-        assert lb.shape == s.shape
+-        assert em.shape == s.shape
++        assert w.shape == s.shape and em.shape == s.shape
++        assert la.shape == s.shape and lb.shape == s.shape
+         assert (w >= 0).all() and (w <= 1).all()
+ 
+-    def test_emission_agreement(self):
+-        x = torch.zeros(4)
+-        y = torch.zeros(4)
+-        e = local_emission_from_logprob_diff(x, y, delta_scale=1.0)
+-        assert torch.allclose(e, torch.ones_like(e))
+ 
+-    def test_terminal_sigmoid(self):
+-        r = terminal_potential_from_reward(5.0, reward_scale=1.0)
+-        assert 0 < r <= 1
++# --------------------------------------------------------------------------- #
++# Latent-state FB primitives.                                                 #
++# --------------------------------------------------------------------------- #
++
++
++class TestLatentPrimitives:
++    def test_build_latent_emission_shape_and_order(self):
++        agreement = torch.tensor([1.0, 0.5, 0.1])
++        log_e = build_latent_emission(agreement, emission_off_level=0.3, num_states=2)
++        assert log_e.shape == (3, 2)
++        # On-track (col 1) should equal log(agreement); off-track constant.
++        assert torch.allclose(log_e[:, 1], torch.log(agreement.clamp(min=1e-12)))
++        assert torch.allclose(log_e[:, 0], torch.full((3,), math.log(0.3)), atol=1e-6)
++
++    def test_build_latent_emission_single_state(self):
++        agreement = torch.tensor([1.0, 0.5])
++        log_e = build_latent_emission(agreement, emission_off_level=0.2, num_states=1)
++        assert log_e.shape == (2, 1)
++
++    def test_boundary_transition_shape(self):
++        log_t = build_boundary_transition(
++            seq_len=5,
++            boundary_mask=None,
++            flip_prob=0.05,
++            boundary_reset_prob=0.5,
++            num_states=2,
++        )
++        assert log_t.shape == (4, 2, 2)
++        row_sums = torch.logsumexp(log_t, dim=-1)
++        assert torch.allclose(row_sums, torch.zeros_like(row_sums), atol=1e-5)
++
++    def test_boundary_transition_resets_at_boundary(self):
++        bm = torch.tensor([0.0, 1.0, 0.0, 0.0])
++        log_t = build_boundary_transition(
++            seq_len=4,
++            boundary_mask=bm,
++            flip_prob=0.01,
++            boundary_reset_prob=1.0,
++            num_states=2,
++        )
++        # Transition from t=1 (boundary) should be uniform (log 0.5).
++        assert torch.allclose(log_t[1], torch.full((2, 2), math.log(0.5)), atol=1e-6)
++        # Non-boundary transition should be near-identity on the diagonal.
++        assert log_t[0, 0, 0] > log_t[0, 0, 1]
++        assert log_t[0, 1, 1] > log_t[0, 1, 0]
++
++    def test_boundary_transition_zero_len(self):
++        log_t = build_boundary_transition(
++            seq_len=1, boundary_mask=None, flip_prob=0.1, boundary_reset_prob=0.5,
++        )
++        assert log_t.shape == (0, 2, 2)
++
++    def test_latent_fb_rows_sum_to_one(self):
++        agreement = torch.tensor([0.9, 0.4, 0.2, 0.7])
++        log_e = build_latent_emission(agreement, emission_off_level=0.3, num_states=2)
++        log_t = build_boundary_transition(
++            seq_len=4, boundary_mask=None, flip_prob=0.05, boundary_reset_prob=0.5
++        )
++        prior = torch.log(torch.tensor([0.5, 0.5]))
++        term = torch.log(torch.tensor([0.3, 0.7]))
++        la, lb, lg = latent_forward_backward(log_e, log_t, prior, term)
++        assert la.shape == lb.shape == lg.shape == (4, 2)
++        row_sums = torch.logsumexp(lg, dim=-1)
++        assert torch.allclose(row_sums, torch.zeros_like(row_sums), atol=1e-5)
++
++
++# --------------------------------------------------------------------------- #
++# Latent FB high-level API behavior.                                          #
++# --------------------------------------------------------------------------- #
++
++
++class TestLatentFBHighLevel:
++    def _default_call(self, reward: float = 1.0, **overrides) -> LatentFBResult:
++        s = torch.tensor([-1.0, -2.0, -0.5, -1.5])
++        t = torch.tensor([-1.1, -1.9, -0.4, -1.6])
++        kw = {
++            "emission_delta_scale": 1.0,
++            "terminal_reward_scale": 1.0,
++        }
++        kw.update(overrides)
++        return compute_latent_fb(s, t, reward, **kw)
++
++    def test_shapes_and_weight_range(self):
++        result = self._default_call()
++        t_len = 4
++        assert result.kl_weights.shape == (t_len,)
++        assert result.log_alpha.shape == (t_len, 2)
++        assert result.log_beta.shape == (t_len, 2)
++        assert result.log_gamma.shape == (t_len, 2)
++        assert result.emission.shape == (t_len, 2)
++        assert (result.kl_weights >= 0).all() and (result.kl_weights <= 1).all()
++        assert 0 < result.terminal_reward <= 1
++
++    def test_terminal_reward_actually_affects_weights(self):
++        # Key invariant broken in the legacy z-scored version: R must change
++        # per-token weights. Here it flows through the terminal β factor, so
++        # even without multiplicative injection the weights must differ.
++        r_hi = self._default_call(reward=5.0)
++        r_lo = self._default_call(reward=-5.0)
++        assert not torch.allclose(r_hi.kl_weights, r_lo.kl_weights, atol=1e-4)
++        # High reward should push weights up (more on-track posterior mass).
++        assert r_hi.kl_weights.mean() > r_lo.kl_weights.mean()
++
++    def test_multiplicative_reward_injection(self):
++        base = self._default_call(reward=0.0, gate_exponent_reward=0.0)
++        amped = self._default_call(reward=5.0, gate_exponent_reward=2.0)
++        # Amped should have both higher R and a larger multiplier.
++        assert amped.terminal_reward > base.terminal_reward
++        assert amped.kl_weights.mean() > 0  # sanity
++        # With same reward, exponent must scale weights monotonically.
++        w_a = self._default_call(reward=1.0, gate_exponent_reward=0.0).kl_weights
++        w_b = self._default_call(reward=1.0, gate_exponent_reward=1.0).kl_weights
++        # γ^1 * R^0 vs γ^1 * R^1 with R<1 → w_b <= w_a pointwise.
++        assert torch.all(w_b <= w_a + 1e-6)
++
++    def test_perfect_agreement_yields_on_track(self):
++        # When student == teacher, emission = 1 on on-track, 0.3 on off-track
++        # → posterior strongly favors on-track → γ_on ≈ 1.
++        s = torch.zeros(5)
++        t = torch.zeros(5)
++        result = compute_latent_fb(
++            s,
++            t,
++            total_reward=5.0,
++            emission_delta_scale=1.0,
++            terminal_reward_scale=1.0,
++        )
++        gamma_on = torch.exp(result.log_gamma[:, 1])
++        assert (gamma_on > 0.9).all()
++
++    def test_disagreement_shifts_posterior_off_track(self):
++        # Large disagreement should depress γ_on.
++        s = torch.tensor([-5.0, -5.0, -5.0, -5.0])
++        t = torch.tensor([-0.5, -0.5, -0.5, -0.5])
++        r_agree = compute_latent_fb(
++            torch.zeros(4), torch.zeros(4),
++            total_reward=0.0,
++            emission_delta_scale=1.0,
++            terminal_reward_scale=1.0,
++        )
++        r_disagree = compute_latent_fb(
++            s, t,
++            total_reward=0.0,
++            emission_delta_scale=1.0,
++            terminal_reward_scale=1.0,
++        )
++        gamma_on_a = torch.exp(r_agree.log_gamma[:, 1]).mean()
++        gamma_on_d = torch.exp(r_disagree.log_gamma[:, 1]).mean()
++        assert gamma_on_d < gamma_on_a - 0.1
++
++    def test_boundary_mask_changes_posterior(self):
++        s = torch.tensor([0.0, 0.0, -3.0, -3.0, 0.0, 0.0])
++        t = torch.tensor([0.0, 0.0, -0.1, -0.1, 0.0, 0.0])
++        # Without boundaries, state is sticky → the disagreement spreads.
++        r_no = compute_latent_fb(
++            s, t, total_reward=1.0,
++            emission_delta_scale=1.0, terminal_reward_scale=1.0,
++            boundary_mask=None,
++        )
++        # With a boundary right after the disagreement region, the posterior
++        # should recover on-track mass more quickly in the tail.
++        bm = torch.zeros(6)
++        bm[3] = 1.0
++        r_bnd = compute_latent_fb(
++            s, t, total_reward=1.0,
++            emission_delta_scale=1.0, terminal_reward_scale=1.0,
++            boundary_mask=bm, boundary_reset_prob=1.0,
++        )
++        tail_no = torch.exp(r_no.log_gamma[4:, 1]).mean()
++        tail_bnd = torch.exp(r_bnd.log_gamma[4:, 1]).mean()
++        assert tail_bnd > tail_no
++
++    def test_empty_sequence(self):
++        s = torch.zeros(0)
++        t = torch.zeros(0)
++        result = compute_latent_fb(
++            s, t, total_reward=1.0,
++            emission_delta_scale=1.0, terminal_reward_scale=1.0,
++        )
++        assert result.kl_weights.numel() == 0
++        assert result.log_alpha.shape == (0, 2)
++
++    def test_num_states_ablation(self):
++        # Going to 3 states should still produce valid posteriors.
++        s = torch.tensor([-1.0, -2.0, -0.5, -1.5])
++        t = torch.tensor([-1.1, -1.9, -0.4, -1.6])
++        result = compute_latent_fb(
++            s, t, total_reward=1.0,
++            emission_delta_scale=1.0, terminal_reward_scale=1.0,
++            num_states=3,
++        )
++        assert result.log_gamma.shape == (4, 3)
++        row_sums = torch.logsumexp(result.log_gamma, dim=-1)
++        assert torch.allclose(row_sums, torch.zeros_like(row_sums), atol=1e-5)
++
++
++# --------------------------------------------------------------------------- #
++# Back-compat wrapper (compute_fb_kl_weights_and_messages).                   #
++# --------------------------------------------------------------------------- #
++
++
++class TestBackCompatWrapper:
++    def test_latent_default_shapes(self):
++        s = torch.tensor([-1.0, -2.0, -0.5])
++        t = torch.tensor([-1.1, -1.9, -0.4])
++        w, la, lb, em = compute_fb_kl_weights_and_messages(
++            s,
++            t,
++            total_reward=1.0,
++            emission_delta_scale=1.0,
++            terminal_reward_scale=1.0,
++            gate_temperature=2.0,
++        )
++        assert w.shape == s.shape and em.shape == s.shape
++        assert la.shape == s.shape and lb.shape == s.shape
++        assert (w >= 0).all() and (w <= 1).all()
+ 
++    def test_boundary_mask_accepted(self):
++        s = torch.tensor([-1.0, -2.0, -0.5, -1.5])
++        t = torch.tensor([-1.1, -1.9, -0.4, -1.6])
++        bm = torch.tensor([0.0, 1.0, 0.0, 0.0])
++        w, *_ = compute_fb_kl_weights_and_messages(
++            s,
++            t,
++            total_reward=1.0,
++            emission_delta_scale=1.0,
++            terminal_reward_scale=1.0,
++            gate_temperature=2.0,
++            boundary_mask=bm,
++        )
++        assert w.shape == s.shape
++        assert (w >= 0).all() and (w <= 1).all()
++
++    def test_empty_wrapper(self):
++        s = torch.zeros(0)
++        t = torch.zeros(0)
++        w, la, lb, em = compute_fb_kl_weights_and_messages(
++            s,
++            t,
++            total_reward=1.0,
++            emission_delta_scale=1.0,
++            terminal_reward_scale=1.0,
++            gate_temperature=2.0,
++        )
++        assert w.numel() == 0 and la.numel() == 0
++        assert lb.numel() == 0 and em.numel() == 0
+diff --git a/tinker_cookbook/distillation/train_wghd.py b/tinker_cookbook/distillation/train_wghd.py
+index 4265b05..13122ca 100644
+--- a/tinker_cookbook/distillation/train_wghd.py
++++ b/tinker_cookbook/distillation/train_wghd.py
+@@ -48,7 +48,10 @@ from tinker_cookbook.distillation.datasets import (
+     CompositeDataset,
+     DistillationDatasetConfig,
+ )
+-from tinker_cookbook.distillation.fb_chain import compute_fb_kl_weights_and_messages
++from tinker_cookbook.distillation.fb_chain import (
++    compute_fb_kl_weights_and_messages,
++    terminal_potential_from_reward,
++)
+ from tinker_cookbook.distillation.waypoint import (
+     WaypointStore,
+     compute_adaptive_kl_weight,
+@@ -91,11 +94,33 @@ class WaypointConfig:
+     min_gap_chars: int = 50
+     waypoint_store_path: str | None = None
+ 
+-    #: ``fb_chain`` = explicit α/β on the token chain (:mod:`fb_chain`); ``cosine`` = legacy waypoint similarity.
++    #: ``fb_chain`` = latent-state α/β on the token chain (:mod:`fb_chain`); ``cosine`` = legacy waypoint similarity.
+     kl_weight_mode: str = "fb_chain"
+     fb_emission_delta_scale: float = 1.0
+     fb_terminal_reward_scale: float = 1.0
+ 
++    # --- Latent-state FB hyperparameters (core method) ---
++    #: Number of latent track states (``K = 2`` = on/off-track, paper default).
++    fb_num_states: int = 2
++    #: Constant emission level for the off-track state; smaller → stronger
++    #: disagreement-driven push toward off-track.
++    fb_emission_off_level: float = 0.3
++    #: Per-step flip probability at non-boundary positions (state persists).
++    fb_transition_flip_prob: float = 0.05
++    #: Mixing weight toward uniform transition at waypoint boundaries (allows reset).
++    fb_boundary_reset_prob: float = 0.5
++    #: Exponent on ``gamma_t(on-track)`` in the per-token KL weight.
++    fb_gate_exponent_gamma: float = 1.0
++    #: Exponent on the multiplicative ``R = sigmoid(rho * return)`` injection
++    #: (0 = outcome enters only through the terminal β factor).
++    fb_gate_exponent_reward: float = 0.0
++    #: Initial probability of being on-track.
++    fb_prior_on_track: float = 0.5
++    #: If ``True``, use waypoint boundaries to modulate transitions.
++    fb_use_waypoint_transition: bool = True
++    #: If ``False``, fall back to the legacy single-state α/β gate (ablation).
++    fb_use_latent: bool = True
++
+ 
+ @trace.scope
+ async def incorporate_kl_penalty_with_waypoints(
+@@ -127,7 +152,10 @@ async def incorporate_kl_penalty_with_waypoints(
+         kl_discount_factor: Discount factor for future KL.
+         waypoint_config: Gating and mode configuration.
+         waypoint_store: Unused by FB mode; kept for API compatibility.
+-        tokenizer: Required for cosine mode (decode tokens to find boundaries).
++        tokenizer: Required for cosine mode and optional for ``fb_chain`` mode
++            (used to decode tokens and derive waypoint-induced transition
++            boundaries). ``fb_chain`` without a tokenizer falls back to a
++            stationary transition matrix.
+     """
+     full_sequence_inputs_D = [
+         datum.model_input.append_int(cast(int, datum.loss_fn_inputs["target_tokens"].data[-1]))
+@@ -157,6 +185,9 @@ async def incorporate_kl_penalty_with_waypoints(
+     fb_log_alpha_mean = 0.0
+     fb_log_beta_mean = 0.0
+     fb_emission_mean = 0.0
++    fb_kl_weight_mean = 0.0
++    fb_boundary_count_total = 0.0
++    fb_terminal_reward_mean = 0.0
+     fb_datum_count = 0
+ 
+     for i, datum in enumerate(data_D):
+@@ -171,10 +202,14 @@ async def incorporate_kl_penalty_with_waypoints(
+                     teacher_logprobs=teacher_logprobs_D[i],
+                     total_reward=total_rewards_D[i],
+                     waypoint_config=waypoint_config,
++                    tokenizer=tokenizer,
+                 )
+                 fb_log_alpha_mean += fb_m["fb/log_alpha_mean"]
+                 fb_log_beta_mean += fb_m["fb/log_beta_mean"]
+                 fb_emission_mean += fb_m["fb/emission_mean"]
++                fb_kl_weight_mean += fb_m["fb/kl_weight_mean"]
++                fb_boundary_count_total += fb_m["fb/boundary_count"]
++                fb_terminal_reward_mean += fb_m["fb/terminal_reward"]
+                 fb_datum_count += 1
+             elif mode == "cosine" and waypoint_store is not None and tokenizer is not None:
+                 kl_weight_per_token, process_reward = _compute_waypoint_gated_weights(
+@@ -226,6 +261,9 @@ async def incorporate_kl_penalty_with_waypoints(
+         metrics["fb/log_alpha_mean"] = fb_log_alpha_mean / n
+         metrics["fb/log_beta_mean"] = fb_log_beta_mean / n
+         metrics["fb/emission_mean"] = fb_emission_mean / n
++        metrics["fb/kl_weight_mean"] = fb_kl_weight_mean / n
++        metrics["fb/boundary_count_mean"] = fb_boundary_count_total / n
++        metrics["fb/terminal_reward_mean"] = fb_terminal_reward_mean / n
+     for dataset_idx, (kl_sum, mask_sum) in per_dataset_kl.items():
+         if mask_sum > 0:
+             metrics[f"teacher_kl/dataset_{dataset_idx}"] = float(kl_sum / mask_sum)
+@@ -233,18 +271,75 @@ async def incorporate_kl_penalty_with_waypoints(
+     return metrics
+ 
+ 
++_EMPTY_FB_DIAG: dict[str, float] = {
++    "fb/log_alpha_mean": 0.0,
++    "fb/log_beta_mean": 0.0,
++    "fb/emission_mean": 0.0,
++    "fb/kl_weight_mean": 0.0,
++    "fb/boundary_count": 0.0,
++    "fb/terminal_reward": 0.0,
++}
++
++
++def _build_fb_boundary_mask(
++    datum: tinker.Datum,
++    seq_len: int,
++    tokenizer: Tokenizer | None,
++    waypoint_config: WaypointConfig,
++) -> torch.Tensor | None:
++    """Build a 0/1 boundary mask of shape ``(seq_len,)`` from waypoint detection.
++
++    Returns ``None`` when waypoint transitions are disabled, the tokenizer is
++    unavailable, decoding fails, or no boundaries are found.
++    """
++    if (
++        not waypoint_config.fb_use_waypoint_transition
++        or tokenizer is None
++        or not waypoint_config.task_type
++    ):
++        return None
++    try:
++        target_tokens = datum.loss_fn_inputs["target_tokens"].data
++        decoded_text = tokenizer.decode(target_tokens)
++    except Exception:
++        return None
++    boundary_chars = detect_boundary_positions(
++        decoded_text,
++        task_type=waypoint_config.task_type,
++        min_gap_chars=waypoint_config.min_gap_chars,
++    )
++    if not boundary_chars:
++        return None
++    token_idxs = _estimate_token_boundaries(decoded_text, boundary_chars, seq_len)
++    if not token_idxs:
++        return None
++    bm = torch.zeros(seq_len, dtype=torch.float32)
++    for idx in token_idxs:
++        if 0 <= idx < seq_len:
++            bm[idx] = 1.0
++    if bm.sum().item() == 0.0:
++        return None
++    return bm
++
++
+ def _compute_fb_chain_kl_weights(
+     datum: tinker.Datum,
+     teacher_logprobs: list[float],
+     total_reward: float,
+     waypoint_config: WaypointConfig,
++    tokenizer: Tokenizer | None = None,
+ ) -> tuple[torch.Tensor, dict[str, float]]:
+-    """Per-token KL weights from explicit forward–backward messages on the token chain."""
++    """Per-token KL weights from the latent-state forward-backward posterior.
++
++    Returns ``(kl_weights, diagnostics)``. Diagnostics include per-token means
++    of the on-track log α / log β / emission slices, the average KL weight,
++    the number of waypoint boundaries used, and the terminal reward factor.
++    """
+     mask = datum.loss_fn_inputs["mask"].to_torch().float()
+     seq_len = len(mask)
+     ones = torch.ones(seq_len, dtype=torch.float32)
+     if seq_len == 0:
+-        return ones, {"fb/log_alpha_mean": 0.0, "fb/log_beta_mean": 0.0, "fb/emission_mean": 0.0}
++        return ones, dict(_EMPTY_FB_DIAG)
+ 
+     teacher_vec = torch.tensor(teacher_logprobs[1:], dtype=torch.float32)
+     if len(teacher_vec) != seq_len:
+@@ -253,6 +348,9 @@ def _compute_fb_chain_kl_weights(
+             teacher_vec = torch.cat([teacher_vec, torch.zeros(seq_len - len(teacher_vec))])
+ 
+     student_logprobs = datum.loss_fn_inputs["logprobs"].to_torch()
++
++    boundary_mask = _build_fb_boundary_mask(datum, seq_len, tokenizer, waypoint_config)
++
+     kl_w, log_alpha, log_beta, emission = compute_fb_kl_weights_and_messages(
+         student_logprobs,
+         teacher_vec,
+@@ -260,16 +358,34 @@ def _compute_fb_chain_kl_weights(
+         emission_delta_scale=waypoint_config.fb_emission_delta_scale,
+         terminal_reward_scale=waypoint_config.fb_terminal_reward_scale,
+         gate_temperature=waypoint_config.gate_temperature,
++        boundary_mask=boundary_mask,
++        num_states=waypoint_config.fb_num_states,
++        emission_off_level=waypoint_config.fb_emission_off_level,
++        transition_flip_prob=waypoint_config.fb_transition_flip_prob,
++        boundary_reset_prob=waypoint_config.fb_boundary_reset_prob,
++        gate_exponent_gamma=waypoint_config.fb_gate_exponent_gamma,
++        gate_exponent_reward=waypoint_config.fb_gate_exponent_reward,
++        prior_on_track=waypoint_config.fb_prior_on_track,
++        use_latent_fb=waypoint_config.fb_use_latent,
+     )
+     kl_w = kl_w * mask + (1.0 - mask) * 1.0
+     msum = float(mask.sum().item())
++    r_terminal = float(
++        terminal_potential_from_reward(total_reward, waypoint_config.fb_terminal_reward_scale)
++    )
++    b_count = float(boundary_mask.sum().item()) if boundary_mask is not None else 0.0
+     if msum <= 0:
+-        diag = {"fb/log_alpha_mean": 0.0, "fb/log_beta_mean": 0.0, "fb/emission_mean": 0.0}
++        diag = dict(_EMPTY_FB_DIAG)
++        diag["fb/boundary_count"] = b_count
++        diag["fb/terminal_reward"] = r_terminal
+         return kl_w, diag
+     diag = {
+         "fb/log_alpha_mean": float((log_alpha * mask).sum().item() / msum),
+         "fb/log_beta_mean": float((log_beta * mask).sum().item() / msum),
+         "fb/emission_mean": float((emission * mask).sum().item() / msum),
++        "fb/kl_weight_mean": float((kl_w * mask).sum().item() / msum),
++        "fb/boundary_count": b_count,
++        "fb/terminal_reward": r_terminal,
+     }
+     return kl_w, diag
+ 
+diff --git a/tinker_cookbook/recipes/distillation/wghd_distillation.py b/tinker_cookbook/recipes/distillation/wghd_distillation.py
+index a2b128f..3127331 100644
+--- a/tinker_cookbook/recipes/distillation/wghd_distillation.py
++++ b/tinker_cookbook/recipes/distillation/wghd_distillation.py
+@@ -2,48 +2,68 @@
+ Waypoint-Guided Hybrid Distillation (WGHD) for reasoning and code tasks.
+ 
+ This recipe implements WGHD, an extension of on-policy distillation. By default
+-it uses **explicit token-chain forward–backward messages** (see
+-``tinker_cookbook.distillation.fb_chain``) to set per-token KL weights from local
+-teacher–student agreement (forward α) and a terminal potential from trajectory
+-return (backward β). Optional ``kl_weight_mode=cosine`` restores segment-wise
+-cosine gating at text boundaries plus waypoint process rewards.
+-
+-Key features:
+-  - FB-chain KL: Per-token weights from α/β tension on the sampled token chain
+-  - Optional cosine mode: Segment-level similarity + process rewards at boundaries
+-
+-Example usage:
+-    # Math (DeepMath) with WGHD
++it uses **latent-state token-chain forward-backward messages** (see
++``tinker_cookbook.distillation.fb_chain``) to set per-token KL weights from
++local teacher-student agreement (emission), waypoint-induced transitions, and
++a terminal potential derived from trajectory return. Optional
++``kl_weight_mode=cosine`` restores the legacy segment-wise cosine gating.
++
++Datasets:
++
++* ``gsm8k`` / ``math500`` / ``hendrycks_math`` — *verifiable* math envs from
++  ``tinker_cookbook.recipes.math_rl`` (correctness rewards via boxed answer
++  grading). **This is the recommended pilot dataset** because the trajectory
++  return drives the FB terminal factor.
++* ``deepmath`` / ``tulu3`` — prompt-only datasets (no env reward); the FB
++  terminal factor will be uninformative (``R = 0.5`` for every trajectory)
++  unless you wire in a separate process reward. Useful for emission-only
++  ablations.
++
++Example usage::
++
++    # GSM8K pilot with default latent FB settings (paper main configuration).
+     python -m tinker_cookbook.recipes.distillation.wghd_distillation \\
+-        model_name=Qwen/Qwen3-8B-Base \\
+-        dataset=deepmath \\
++        model_name=Qwen/Qwen2.5-1.5B \\
++        teacher_model=Qwen/Qwen2.5-7B-Instruct \\
++        dataset=gsm8k \\
++        task_type=math \\
+         learning_rate=1e-4 \\
+-        groups_per_batch=1024 \\
+-        lora_rank=128 \\
+-        wandb_project=cookbook_wghd
++        groups_per_batch=128 \\
++        group_size=4 \\
++        max_tokens=1024 \\
++        wandb_project=wghd_gsm8k_pilot
+ 
+-    # With custom waypoint settings
++    # Ablation: legacy single-state FB (z-scored) without latent posterior.
+     python -m tinker_cookbook.recipes.distillation.wghd_distillation \\
+-        model_name=Qwen/Qwen3-8B-Base \\
+-        dataset=deepmath \\
+-        similarity_threshold=0.4 \\
+-        gate_temperature=8.0 \\
+-        step_reward=0.15 \\
+-        wandb_project=cookbook_wghd
+-
+-    # Code tasks
++        model_name=Qwen/Qwen2.5-1.5B \\
++        teacher_model=Qwen/Qwen2.5-7B-Instruct \\
++        dataset=gsm8k \\
++        fb_use_latent=false \\
++        wandb_project=wghd_gsm8k_pilot
++
++    # Ablation: drop waypoint transitions (uniform stationary transition).
++    python -m tinker_cookbook.recipes.distillation.wghd_distillation \\
++        model_name=Qwen/Qwen2.5-1.5B \\
++        teacher_model=Qwen/Qwen2.5-7B-Instruct \\
++        dataset=gsm8k \\
++        fb_use_waypoint_transition=false \\
++        wandb_project=wghd_gsm8k_pilot
++
++    # Ablation: multiplicative R injection on top of the terminal factor.
+     python -m tinker_cookbook.recipes.distillation.wghd_distillation \\
+-        model_name=Qwen/Qwen3-8B-Base \\
+-        dataset=tulu3 \\
+-        task_type=code \\
+-        wandb_project=cookbook_wghd
++        model_name=Qwen/Qwen2.5-1.5B \\
++        teacher_model=Qwen/Qwen2.5-7B-Instruct \\
++        dataset=gsm8k \\
++        fb_gate_exponent_reward=1.0 \\
++        wandb_project=wghd_gsm8k_pilot
+ 
+-    # Disable waypoint gating (falls back to standard on-policy distillation)
++    # Disable waypoint gating altogether (falls back to vanilla on-policy KL).
+     python -m tinker_cookbook.recipes.distillation.wghd_distillation \\
+-        model_name=Qwen/Qwen3-8B-Base \\
+-        dataset=deepmath \\
++        model_name=Qwen/Qwen2.5-1.5B \\
++        teacher_model=Qwen/Qwen2.5-7B-Instruct \\
++        dataset=gsm8k \\
+         waypoint_enabled=false \\
+-        wandb_project=cookbook_wghd
++        wandb_project=wghd_gsm8k_pilot
+ """
+ 
+ import asyncio
+@@ -63,32 +83,88 @@ from tinker_cookbook.distillation.datasets import (
+     TeacherConfig,
+ )
+ from tinker_cookbook.distillation.train_wghd import WaypointConfig
++from tinker_cookbook.recipes.math_rl.math_env import (
++    Gsm8kDatasetBuilder,
++    MathDatasetBuilder,
++)
++from tinker_cookbook.rl.types import RLDatasetBuilder
+ 
+ logger = logging.getLogger(__name__)
+ 
++#: Datasets that use ``math_rl.MathEnv`` and therefore expose a verifiable
++#: trajectory reward (correct/incorrect via boxed-answer grading). These are
++#: required to exercise the FB terminal factor.
++_VERIFIABLE_MATH_DATASETS = {"gsm8k", "math", "hendrycks_math"}
++
++
++def _build_dataset_builder(
++    dataset_name: str,
++    *,
++    groups_per_batch: int,
++    group_size: int,
++    model_name_for_tokenizer: str,
++    renderer_name: str,
++) -> RLDatasetBuilder:
++    """Pick a dataset builder for distillation based on ``dataset_name``.
++
++    Verifiable math datasets (``gsm8k`` / ``math``) carry per-trajectory
++    correctness rewards needed by the FB terminal factor. Prompt-only datasets
++    (``deepmath`` / ``tulu3``) provide no env reward; they fall back to a
++    constant ``R = 0.5`` and only the FB emission and waypoint transitions
++    will inform the per-token weights.
++    """
++    if dataset_name == "gsm8k":
++        return Gsm8kDatasetBuilder(
++            batch_size=groups_per_batch,
++            model_name_for_tokenizer=model_name_for_tokenizer,
++            renderer_name=renderer_name,
++            group_size=group_size,
++        )
++    if dataset_name in {"math", "hendrycks_math"}:
++        return MathDatasetBuilder(
++            batch_size=groups_per_batch,
++            model_name_for_tokenizer=model_name_for_tokenizer,
++            renderer_name=renderer_name,
++            group_size=group_size,
++        )
++    if dataset_name in {"deepmath", "tulu3"}:
++        return PromptOnlyDatasetBuilder(
++            dataset_name=dataset_name,
++            groups_per_batch=groups_per_batch,
++            group_size=group_size,
++            model_name_for_tokenizer=model_name_for_tokenizer,
++            renderer_name=renderer_name,
++        )
++    raise ValueError(
++        f"Unknown dataset {dataset_name!r}. "
++        f"Supported: gsm8k, math, hendrycks_math, deepmath, tulu3."
++    )
++
+ 
+ @chz.chz
+ class CLIConfig:
+     """Command-line configuration for WGHD distillation."""
+ 
+-    # Model configuration
+-    model_name: str = "Qwen/Qwen3-8B-Base"
+-    lora_rank: int = 128
++    # --- Model configuration ---
++    model_name: str = "Qwen/Qwen2.5-1.5B"
++    lora_rank: int = 32
+     renderer_name: str | None = None
+     load_checkpoint_path: str | None = None
+ 
+-    # Teacher configuration
+-    teacher_model: str = "Qwen/Qwen3-8B"
++    # --- Teacher configuration ---
++    teacher_model: str = "Qwen/Qwen2.5-7B-Instruct"
+     teacher_checkpoint: str | None = None
+ 
+-    # Dataset configuration
+-    dataset: str = "deepmath"
++    # --- Dataset configuration ---
++    #: One of ``gsm8k``, ``math``, ``hendrycks_math``, ``deepmath``, ``tulu3``.
++    #: Use a verifiable math dataset to exercise the FB terminal reward factor.
++    dataset: str = "gsm8k"
+ 
+-    # Training hyperparameters
++    # --- Training hyperparameters ---
+     group_size: int = 4
+-    groups_per_batch: int = 1024
++    groups_per_batch: int = 128
+     learning_rate: float = 1e-4
+-    max_tokens: int = 4096
++    max_tokens: int = 1024
+     temperature: float = 1.0
+     kl_penalty_coef: float = 1.0
+     kl_discount_factor: float = 0.0
+@@ -98,11 +174,11 @@ class CLIConfig:
+     loss_fn: LossFnType = "importance_sampling"
+     loss_fn_config: dict[str, Any] | None = None
+ 
+-    # WGHD-specific: FB chain (default) or cosine waypoint gating
++    # --- WGHD: gating mode ---
+     waypoint_enabled: bool = True
++    #: ``fb_chain`` (default) = latent-state forward-backward;
++    #: ``cosine`` = legacy waypoint-similarity heuristic.
+     kl_weight_mode: str = "fb_chain"
+-    fb_emission_delta_scale: float = 1.0
+-    fb_terminal_reward_scale: float = 1.0
+     task_type: str = "math"
+     similarity_threshold: float = 0.5
+     gate_temperature: float = 5.0
+@@ -110,7 +186,31 @@ class CLIConfig:
+     min_gap_chars: int = 50
+     waypoint_store_path: str | None = None
+ 
+-    # Logging configuration
++    # --- Latent FB hyperparameters (paper-method knobs) ---
++    fb_emission_delta_scale: float = 1.0
++    fb_terminal_reward_scale: float = 1.0
++    #: Latent track-state cardinality. ``2`` = on/off (paper default).
++    fb_num_states: int = 2
++    #: Constant emission level for the off-track latent state.
++    fb_emission_off_level: float = 0.3
++    #: Per-step state flip probability at non-boundary positions.
++    fb_transition_flip_prob: float = 0.05
++    #: Mixing weight toward uniform transition at waypoint boundaries.
++    fb_boundary_reset_prob: float = 0.5
++    #: Exponent on ``gamma_t(on-track)`` in the per-token KL weight.
++    fb_gate_exponent_gamma: float = 1.0
++    #: Exponent on the multiplicative ``R`` injection on the per-token weight.
++    #: ``0.0`` keeps the outcome influence purely through the terminal beta.
++    fb_gate_exponent_reward: float = 0.0
++    #: Initial probability of being on-track.
++    fb_prior_on_track: float = 0.5
++    #: If ``False``, ignore waypoint boundaries (stationary transition).
++    fb_use_waypoint_transition: bool = True
++    #: If ``False``, fall back to the legacy single-state alpha/beta gate
++    #: (ablation; useful to measure the contribution of latent FB).
++    fb_use_latent: bool = True
++
++    # --- Logging configuration ---
+     log_path: str | None = None
+     wandb_project: str | None = None
+     wandb_name: str | None = None
+@@ -136,6 +236,14 @@ async def cli_main(cli_config: CLIConfig):
+         base_url=cli_config.base_url,
+     )
+ 
++    if cli_config.dataset not in _VERIFIABLE_MATH_DATASETS:
++        logger.warning(
++            "Dataset %r has no env reward; the FB terminal factor will be "
++            "constant (R = 0.5). Use 'gsm8k' or 'math' for a meaningful "
++            "outcome signal.",
++            cli_config.dataset,
++        )
++
+     if cli_config.log_path is not None:
+         log_path = cli_config.log_path
+     else:
+@@ -143,7 +251,7 @@ async def cli_main(cli_config: CLIConfig):
+         run_name = (
+             f"wghd-{cli_config.dataset}-{model_name}-"
+             f"{cli_config.lora_rank}rank-{cli_config.learning_rate}lr-"
+-            f"t{cli_config.similarity_threshold}-"
++            f"K{cli_config.fb_num_states}-"
+             f"{datetime.now().strftime('%Y-%m-%d-%H-%M')}"
+         )
+         log_path = f"/tmp/tinker-examples/wghd/{run_name}"
+@@ -153,8 +261,8 @@ async def cli_main(cli_config: CLIConfig):
+     else:
+         wandb_name = Path(log_path).name
+ 
+-    dataset_builder = PromptOnlyDatasetBuilder(
+-        dataset_name=cli_config.dataset,
++    dataset_builder = _build_dataset_builder(
++        cli_config.dataset,
+         groups_per_batch=cli_config.groups_per_batch,
+         group_size=cli_config.group_size,
+         model_name_for_tokenizer=cli_config.model_name,
+@@ -183,6 +291,15 @@ async def cli_main(cli_config: CLIConfig):
+         kl_weight_mode=cli_config.kl_weight_mode,
+         fb_emission_delta_scale=cli_config.fb_emission_delta_scale,
+         fb_terminal_reward_scale=cli_config.fb_terminal_reward_scale,
++        fb_num_states=cli_config.fb_num_states,
++        fb_emission_off_level=cli_config.fb_emission_off_level,
++        fb_transition_flip_prob=cli_config.fb_transition_flip_prob,
++        fb_boundary_reset_prob=cli_config.fb_boundary_reset_prob,
++        fb_gate_exponent_gamma=cli_config.fb_gate_exponent_gamma,
++        fb_gate_exponent_reward=cli_config.fb_gate_exponent_reward,
++        fb_prior_on_track=cli_config.fb_prior_on_track,
++        fb_use_waypoint_transition=cli_config.fb_use_waypoint_transition,
++        fb_use_latent=cli_config.fb_use_latent,
+     )
+ 
+     config = train_wghd.Config(
