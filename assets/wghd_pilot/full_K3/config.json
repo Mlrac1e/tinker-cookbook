@@ -1,0 +1,63 @@
+{
+  "learning_rate": 0.0001,
+  "dataset_configs": [
+    {
+      "dataset_builder": {
+        "batch_size": 32,
+        "model_name_for_tokenizer": "meta-llama/Llama-3.2-3B",
+        "renderer_name": "role_colon",
+        "group_size": 4,
+        "convo_prefix": "standard",
+        "seed": 0
+      },
+      "teacher_config": {
+        "base_model": "meta-llama/Llama-3.1-8B-Instruct",
+        "load_checkpoint_path": null
+      },
+      "groups_per_batch": 32
+    }
+  ],
+  "model_name": "meta-llama/Llama-3.2-3B",
+  "renderer_name": "role_colon",
+  "max_tokens": 512,
+  "temperature": 1.0,
+  "compute_post_kl": false,
+  "evaluator_builders": [],
+  "lora_rank": 32,
+  "kl_penalty_coef": 1.0,
+  "kl_discount_factor": 0.0,
+  "loss_fn": "importance_sampling",
+  "loss_fn_config": null,
+  "num_substeps": 1,
+  "waypoint_config": {
+    "enabled": true,
+    "task_type": "math",
+    "similarity_threshold": 0.5,
+    "gate_temperature": 5.0,
+    "step_reward": 0.1,
+    "min_gap_chars": 50,
+    "waypoint_store_path": null,
+    "kl_weight_mode": "fb_chain",
+    "fb_emission_delta_scale": 1.0,
+    "fb_terminal_reward_scale": 1.0,
+    "fb_num_states": 3,
+    "fb_emission_off_level": 0.3,
+    "fb_transition_flip_prob": 0.05,
+    "fb_boundary_reset_prob": 0.5,
+    "fb_gate_exponent_gamma": 1.0,
+    "fb_gate_exponent_reward": 1.0,
+    "fb_prior_on_track": 0.5,
+    "fb_use_waypoint_transition": true,
+    "fb_use_latent": true
+  },
+  "wandb_project": "wghd_gsm8k_pilot",
+  "wandb_name": "full_K3",
+  "log_path": "/x2robot_v2/miracle/distillation/tinker-cookbook/assets/wghd_pilot/full_K3",
+  "base_url": null,
+  "enable_trace": false,
+  "span_chart_every": 0,
+  "eval_every": 20,
+  "save_every": 50,
+  "load_checkpoint_path": null,
+  "max_steps": 100
+}
